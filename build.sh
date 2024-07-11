@@ -33,8 +33,8 @@ export KBUILD_LINKER_STRING
 
 DEVICE=$1
 
-if [[ "${DEVICE}" = "monet" ] || [ "${DEVICE}" = "vangogh" ]]; then
-DEFCONFIG=milito.config
+if [[ "${DEVICE}" = "monet" ] || [ "${DEVICE}" = "vangogh" ] || [ "${DEVICE}" = "picasso" ]]; then
+DEFCONFIG=milito_defconfig
 DEVICE=milito
 fi
 
@@ -47,7 +47,7 @@ DATE=$(date '+%Y%m%d-%H%M')
 # Set our directory
 OUT_DIR=out/
 
-VERSION="Skizo-ksu-${DEVICE}-${DATE}"
+VERSION="Yuragi-${DEVICE}-${DATE}"
 
 # Export Zip name
 export ZIPNAME="${VERSION}.zip"
