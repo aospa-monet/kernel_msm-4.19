@@ -34,7 +34,7 @@ static unsigned int counter_delta(struct kgsl_device *device,
 
 static struct devfreq_msm_adreno_tz_data adreno_tz_data = {
 	.bus = {
-		.max = 350,
+		.max = 1200,
 		.floating = true,
 	},
 	.device_id = KGSL_DEVICE_3D0,
@@ -500,9 +500,6 @@ static irqreturn_t adreno_irq_handler(struct kgsl_device *device)
 	unsigned int status = 0, fence = 0, fence_retries = 0, tmp, int_bit;
 	unsigned int shadow_status = 0;
 	int i;
-	u64 ts, ts1, ts2;
-
-	ts = gmu_core_dev_read_ao_counter(device);
 
 	atomic_inc(&adreno_dev->pending_irq_refcnt);
 	/* Ensure this increment is done before the IRQ status is updated */
@@ -529,8 +526,6 @@ static irqreturn_t adreno_irq_handler(struct kgsl_device *device)
 				&fence);
 
 		while (fence != 0) {
-			ts1 =  gmu_core_dev_read_ao_counter(device);
-
 			/* Wait for small time before trying again */
 			udelay(1);
 			adreno_readreg(adreno_dev,
@@ -538,16 +533,14 @@ static irqreturn_t adreno_irq_handler(struct kgsl_device *device)
 					&fence);
 
 			if (fence_retries == FENCE_RETRY_MAX && fence != 0) {
-				ts2 =  gmu_core_dev_read_ao_counter(device);
-
 				adreno_readreg(adreno_dev,
 					ADRENO_REG_GMU_RBBM_INT_UNMASKED_STATUS,
 					&shadow_status);
 
 				dev_crit_ratelimited(device->dev,
-					"Status=0x%x Unmasked status=0x%x Timestamps:%llx %llx %llx\n",
+					"Status=0x%x Unmasked status=0x%x\n",
 					shadow_status & irq_params->mask,
-					shadow_status, ts, ts1, ts2);
+					shadow_status);
 
 				adreno_set_gpu_fault(adreno_dev,
 						ADRENO_GMU_FAULT);
@@ -3372,14 +3365,12 @@ int adreno_gmu_fenced_write(struct adreno_device *adreno_dev,
 	struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
 	unsigned int reg_offset = gpudev->reg_offsets->offsets[offset];
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
-	u64 ts1, ts2;
 
 	adreno_writereg(adreno_dev, offset, val);
 
 	if (!gmu_core_isenabled(KGSL_DEVICE(adreno_dev)))
 		return 0;
 
-	ts1 = gmu_core_dev_read_ao_counter(device);
 	for (i = 0; i < GMU_CORE_LONG_WAKEUP_RETRY_LIMIT; i++) {
 		/*
 		 * Make sure the previous register write is posted before
@@ -3411,13 +3402,11 @@ int adreno_gmu_fenced_write(struct adreno_device *adreno_dev,
 	if (i < GMU_CORE_SHORT_WAKEUP_RETRY_LIMIT)
 		return 0;
 
-	ts2 = gmu_core_dev_read_ao_counter(device);
-
 	if (i == GMU_CORE_LONG_WAKEUP_RETRY_LIMIT) {
 		dev_err(device->dev,
-			"Timed out waiting %d usecs to write fenced register 0x%x, timestamps %llu %llu, status 0x%x\n",
+			"Timed out waiting %d usecs to write fenced register 0x%x, status 0x%x\n",
 			i * GMU_CORE_WAKEUP_DELAY_US,
-			reg_offset, ts1, ts2, status);
+			reg_offset, status);
 
 		return -ETIMEDOUT;
 	}
@@ -4118,7 +4107,7 @@ static struct platform_driver kgsl_bus_platform_driver = {
 	}
 };
 
-static int __init kgsl_3d_init(void)
+static int __kgsl_3d_init(void *arg)
 {
 	int ret;
 
@@ -4131,6 +4120,16 @@ static int __init kgsl_3d_init(void)
 		platform_driver_unregister(&kgsl_bus_platform_driver);
 
 	return ret;
+}
+
+static int __init kgsl_3d_init(void)
+{
+	struct task_struct *kgsl_3d_init_task =
+		kthread_run(__kgsl_3d_init, NULL, "kgsl_3d_init");
+	if (IS_ERR(kgsl_3d_init_task))
+		return PTR_ERR(kgsl_3d_init_task);
+	else
+		return 0;
 }
 
 static void __exit kgsl_3d_exit(void)

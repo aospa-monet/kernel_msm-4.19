@@ -291,23 +291,26 @@ static void __update_inv_weight(struct load_weight *lw)
 static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight *lw)
 {
 	u64 fact = scale_load_down(weight);
+	u32 fact_hi = (u32)(fact >> 32);
 	int shift = WMULT_SHIFT;
+	int fs;
 
 	__update_inv_weight(lw);
 
-	if (unlikely(fact >> 32)) {
-		while (fact >> 32) {
-			fact >>= 1;
-			shift--;
-		}
+	if (unlikely(fact_hi)) {
+		fs = fls(fact_hi);
+		shift -= fs;
+		fact >>= fs;
 	}
 
 	/* hint to use a 32x32->64 mul */
 	fact = (u64)(u32)fact * lw->inv_weight;
 
-	while (fact >> 32) {
-		fact >>= 1;
-		shift--;
+	fact_hi = (u32)(fact >> 32);
+	if (fact_hi) {
+		fs = fls(fact_hi);
+		shift -= fs;
+		fact >>= fs;
 	}
 
 	return mul_u64_u32_shr(delta_exec, fact, shift);
@@ -6645,9 +6648,11 @@ static inline bool test_idle_cores(int cpu, bool def)
 {
 	struct sched_domain_shared *sds;
 
-	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
-	if (sds)
-		return READ_ONCE(sds->has_idle_cores);
+	if (static_branch_likely(&sched_smt_present)) {
+		sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
+		if (sds)
+			return READ_ONCE(sds->has_idle_cores);
+	}
 
 	return def;
 }
@@ -7815,77 +7820,134 @@ cpu_util_next_walt(int cpu, struct task_struct *p, int dst_cpu)
 }
 #endif
 
-/*
- * compute_energy(): Estimates the energy that would be consumed if @p was
- * migrated to @dst_cpu. compute_energy() predicts what will be the utilization
- * landscape of the * CPUs after the task migration, and uses the Energy Model
- * to compute what would be the energy if we decided to actually migrate that
- * task.
- */
-static long
-compute_energy(struct task_struct *p, int dst_cpu, struct perf_domain *pd)
+struct em_calc {
+	unsigned long energy_util;
+	unsigned long cpu_util;
+};
+
+static void
+calc_energy(struct em_calc *ec, struct task_struct *p, struct perf_domain *pd,
+	    unsigned long cpu_cap, int cpu, int dst)
 {
-	unsigned int max_util, cpu_util, cpu_cap;
-	unsigned long sum_util, energy = 0;
-	int cpu;
+	unsigned int util_cfs;
+
+	/*
+	 * The capacity state of CPUs of the current rd can be driven by CPUs of
+	 * another rd if they belong to the same performance domain. So, account
+	 * for the utilization of these CPUs too by masking pd with
+	 * cpu_online_mask instead of the rd span.
+	 *
+	 * If an entire performance domain is outside of the current rd, it will
+	 * not appear in its pd list and will not be accounted.
+	 */
+	util_cfs = cpu_util_next(cpu, p, dst);
+
+	/*
+	 * Busy time computation: utilization clamping is not required since the
+	 * ratio (sum_util / cpu_capacity) is already enough to scale the EM
+	 * reported power consumption at the (eventually clamped) cpu_capacity.
+	 */
+	ec->energy_util = schedutil_cpu_util(cpu, util_cfs, cpu_cap,
+						       ENERGY_UTIL, NULL);
+
+	/*
+	 * Performance domain frequency: utilization clamping must be considered
+	 * since it affects the selection of the performance domain frequency.
+	 * NOTE: in case RT tasks are running, by default the FREQUENCY_UTIL's
+	 * utilization can be max OPP.
+	 */
+	ec->cpu_util = schedutil_cpu_util(cpu, util_cfs, cpu_cap,
+						    FREQUENCY_UTIL,
+						    cpu == dst ? p : NULL);
+}
+
+/*
+ * @energy is expected to be initialized to zero for each CPU in @dst_mask.
+ *
+ * When @p moves to a new cluster, it affects power for both its old cluster and
+ * new cluster. All CPUs in the source and destination clusters need to have
+ * energy recomputed. But the energy calculation can be cached for any CPUs in
+ * these clusters which are neither the source CPU nor destination CPU. If a CPU
+ * is the one that @p moves off of, then it needs to have energy recomputed with
+ * @p removed. If a CPU is the one that @p moves onto, then it needs to have
+ * energy recomputed with @p added. But the other CPUs in the cluster only need
+ * to have energy recomputed due to the effect of schedutil increasing CPU
+ * frequency for the destination CPU cluster and/or decreasing CPU frequency for
+ * the source CPU cluster. The other CPUs in the source and destination clusters
+ * are otherwise unaffected, and thus their energy calculation can be cached.
+ */
+static void
+compute_energy_change(struct task_struct *p, struct perf_domain *pd, int src,
+		      const cpumask_t *dst_mask, unsigned long energy[NR_CPUS])
+{
+	/*
+	 * cached_calc[0] is for when @p moves _to_ a given CPU's cluster.
+	 * cached_calc[1] is for when @p moves _from_ a given CPU's cluster.
+	 */
+	static DEFINE_PER_CPU_ALIGNED(struct em_calc [2][NR_CPUS], cached_calc);
+	cpumask_t *cmask, cached_mask[2] = {};
+	struct em_calc *cache, *ec, tmp_ec;
+	bool from, no_cache;
+	unsigned long cap;
+	int cpu, dst;
 
 	for (; pd; pd = pd->next) {
-		struct cpumask *pd_mask = perf_domain_span(pd);
+		const cpumask_t *pd_mask = perf_domain_span(pd);
 
 		/*
 		 * The energy model mandates all the CPUs of a performance
 		 * domain have the same capacity.
 		 */
-		cpu_cap = arch_scale_cpu_capacity(NULL, cpumask_first(pd_mask));
-		max_util = sum_util = 0;
+		cap = arch_scale_cpu_capacity(NULL, cpumask_first(pd_mask));
 
 		/*
-		 * The capacity state of CPUs of the current rd can be driven by
-		 * CPUs of another rd if they belong to the same performance
-		 * domain. So, account for the utilization of these CPUs too
-		 * by masking pd with cpu_online_mask instead of the rd span.
-		 *
-		 * If an entire performance domain is outside of the current rd,
-		 * it will not appear in its pd list and will not be accounted
-		 * by compute_energy().
+		 * The cache index is 0 if @p is moving to this cluster, and 1
+		 * if @p is moving away from this cluster.
 		 */
-		for_each_cpu_and(cpu, pd_mask, cpu_online_mask) {
-#ifdef CONFIG_SCHED_WALT
-			cpu_util = cpu_util_next_walt(cpu, p, dst_cpu);
-			sum_util += cpu_util;
-#else
-			unsigned int util_cfs;
-			struct task_struct *tsk;
+		from = cpumask_test_cpu(src, pd_mask);
+		cache = this_cpu_ptr(cached_calc)[from];
+		cmask = &cached_mask[from];
 
-			util_cfs = cpu_util_next(cpu, p, dst_cpu);
+		/* Calculate energy for each CPU @dst if @p moves to @dst */
+		for_each_cpu(dst, dst_mask) {
+			unsigned long sum_util = 0;
+			unsigned int max_util = 0;
 
-			/*
-			 * Busy time computation: utilization clamping is not
-			 * required since the ratio (sum_util / cpu_capacity)
-			 * is already enough to scale the EM reported power
-			 * consumption at the (eventually clamped) cpu_capacity.
-			 */
-			sum_util += schedutil_cpu_util(cpu, util_cfs, cpu_cap,
-						       ENERGY_UTIL, NULL);
+			/* Compute @p's energy change for this cluster's CPUs */
+			for_each_cpu_and(cpu, pd_mask, cpu_online_mask) {
+				/*
+				 * Calculate the effect of @p moving to or from
+				 * this specific CPU. This calculation is unique
+				 * for the source and destination CPU and thus
+				 * cannot be cached. This is O(2*CPU_NR).
+				 *
+				 * Otherwise, calculate the effect of @p's
+				 * migration to @dst on this CPU that's neither
+				 * the source nor destination CPU, but is part
+				 * of the source or destination cluster. It is
+				 * therefore affected by CPU frequency changes
+				 * for its cluster. This calculation can be
+				 * cached, as mentioned in the large comment
+				 * above. This is also O(2*CPU_NR).
+				 */
+				no_cache = cpu == dst || cpu == src;
+				ec = no_cache ? &tmp_ec : &cache[cpu];
+				if (no_cache || !cpumask_test_cpu(cpu, cmask)) {
+					/* Get @cpu's energy if @p is on @dst */
+					calc_energy(ec, p, pd, cap, cpu, dst);
+					if (!no_cache)
+						__cpumask_set_cpu(cpu, cmask);
+				}
 
-			/*
-			 * Performance domain frequency: utilization clamping
-			 * must be considered since it affects the selection
-			 * of the performance domain frequency.
-			 * NOTE: in case RT tasks are running, by default the
-			 * FREQUENCY_UTIL's utilization can be max OPP.
-			 */
-			tsk = cpu == dst_cpu ? p : NULL;
-			cpu_util = schedutil_cpu_util(cpu, util_cfs, cpu_cap,
-						      FREQUENCY_UTIL, tsk);
-#endif
-			max_util = max(max_util, cpu_util);
+				sum_util += ec->energy_util;
+				if (ec->cpu_util > max_util)
+					max_util = ec->cpu_util;
+			}
+
+			/* Add in this cluster's energy impact for @p on @dst */
+			energy[dst] += em_pd_energy(pd->em_pd, max_util, sum_util);
 		}
-
-		energy += em_pd_energy(pd->em_pd, max_util, sum_util);
 	}
-
-	return energy;
 }
 
 static void select_cpu_candidates(struct sched_domain *sd, cpumask_t *cpus,
@@ -8047,7 +8109,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 				     int sync, bool sync_boost,
 				     int sibling_count_hint)
 {
-	unsigned long prev_energy = ULONG_MAX, best_energy = ULONG_MAX;
+	unsigned long prev_energy = ULONG_MAX, best_energy = ULONG_MAX, energy[NR_CPUS] = {0};
 	struct root_domain *rd = cpu_rq(smp_processor_id())->rd;
 	int weight, cpu = smp_processor_id(), best_energy_cpu = prev_cpu;
 	unsigned long cur_energy;
@@ -8165,8 +8227,12 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 		goto unlock;
 	}
 
+	__cpumask_set_cpu(prev_cpu, candidates);
+	compute_energy_change(p, pd, prev_cpu, candidates, energy);
+	__cpumask_clear_cpu(prev_cpu, candidates);
+
 	if (cpumask_test_cpu(prev_cpu, &p->cpus_allowed))
-		prev_energy = best_energy = compute_energy(p, prev_cpu, pd);
+		prev_energy = best_energy = energy[prev_cpu];
 	else
 		prev_energy = best_energy = ULONG_MAX;
 
@@ -8174,7 +8240,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 	for_each_cpu(cpu, candidates) {
 		if (cpu == prev_cpu)
 			continue;
-		cur_energy = compute_energy(p, cpu, pd);
+		cur_energy = energy[cpu];
 		trace_sched_compute_energy(p, cpu, cur_energy, prev_energy,
 					   best_energy, best_energy_cpu);
 		if (cur_energy < best_energy) {
@@ -9261,8 +9327,12 @@ redo:
 		p = list_last_entry(tasks, struct task_struct, se.group_node);
 
 		env->loop++;
-		/* We've more or less seen every task there is, call it quits */
-		if (env->loop > env->loop_max)
+		/*
+		 * We've more or less seen every task there is, call it quits
+		 * unless we haven't found any movable task yet.
+		 */
+		if (env->loop > env->loop_max &&
+		    !(env->flags & LBF_ALL_PINNED))
 			break;
 
 		/* Abort the loop, if we spent more than 5 msec */
@@ -9699,8 +9769,15 @@ static unsigned long scale_rt_capacity(int cpu, unsigned long max)
 	if (unlikely(irq >= max))
 		return 1;
 
+	/*
+	 * avg_rt.util_avg and avg_dl.util_avg track binary signals
+	 * (running and not running) with weights 0 and 1024 respectively.
+	 * avg_thermal.load_avg tracks thermal pressure and the weighted
+	 * average uses the actual delta max capacity(load).
+	 */
 	used = READ_ONCE(rq->avg_rt.util_avg);
 	used += READ_ONCE(rq->avg_dl.util_avg);
+	used += thermal_load_avg(rq);
 
 	if (unlikely(used >= max))
 		return 1;
@@ -9753,11 +9830,6 @@ void update_group_capacity(struct sched_domain *sd, int cpu)
 	struct sched_domain *child = sd->child;
 	struct sched_group *group, *sdg = sd->groups;
 	unsigned long capacity, min_capacity, max_capacity;
-	unsigned long interval;
-
-	interval = msecs_to_jiffies(sd->balance_interval);
-	interval = clamp(interval, 1UL, max_load_balance_interval);
-	sdg->sgc->next_update = jiffies + interval;
 
 	if (!child) {
 		update_cpu_capacity(sd, cpu);
@@ -10260,10 +10332,7 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
 		if (local_group) {
 			sds->local = sg;
 			sgs = local;
-
-			if (env->idle != CPU_NEWLY_IDLE ||
-			    time_after_eq(jiffies, sg->sgc->next_update))
-				update_group_capacity(env->sd, env->dst_cpu);
+			update_group_capacity(env->sd, env->dst_cpu);
 		}
 
 		update_sg_lb_stats(env, sg, sgs, &sg_status);
@@ -11133,7 +11202,9 @@ more_balance:
 
 		if (env.flags & LBF_NEED_BREAK) {
 			env.flags &= ~LBF_NEED_BREAK;
-			goto more_balance;
+			/* Stop if we tried all running tasks */
+			if (env.loop < busiest->nr_running)
+				goto more_balance;
 		}
 
 		/*
@@ -12569,6 +12640,33 @@ static void propagate_entity_cfs_rq(struct sched_entity *se)
 static void propagate_entity_cfs_rq(struct sched_entity *se) { }
 #endif
 
+unsigned int sched_dvfs_headroom[8] = { [0 ... 8 - 1] = 1280 };
+
+unsigned long apply_dvfs_headroom(unsigned long util, int cpu, bool tapered)
+{
+	if (tapered) {
+		unsigned long capacity = capacity_orig_of(cpu);
+		unsigned long headroom;
+
+		if (util >= capacity)
+			return util;
+
+		/*
+		 * Taper the boosting at e top end as these are expensive and
+		 * we don't need that much of a big headroom as we approach max
+		 * capacity
+		 *
+		 */
+		headroom = (capacity - util);
+		/* formula: headroom * (1.X - 1) == headroom * 0.X */
+		headroom = headroom *
+			(sched_dvfs_headroom[cpu] - SCHED_CAPACITY_SCALE) >> SCHED_CAPACITY_SHIFT;
+		return util + headroom;
+	}
+
+	return util * sched_dvfs_headroom[cpu] >> SCHED_CAPACITY_SHIFT;
+}
+
 static void detach_entity_cfs_rq(struct sched_entity *se)
 {
 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
@@ -12727,8 +12825,6 @@ void free_fair_sched_group(struct task_group *tg)
 {
 	int i;
 
-	destroy_cfs_bandwidth(tg_cfs_bandwidth(tg));
-
 	for_each_possible_cpu(i) {
 		if (tg->cfs_rq)
 			kfree(tg->cfs_rq[i]);
@@ -12804,6 +12900,8 @@ void unregister_fair_sched_group(struct task_group *tg)
 	unsigned long flags;
 	struct rq *rq;
 	int cpu;
+
+	destroy_cfs_bandwidth(tg_cfs_bandwidth(tg));
 
 	for_each_possible_cpu(cpu) {
 		if (tg->se[cpu])

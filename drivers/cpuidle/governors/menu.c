@@ -183,7 +183,7 @@ static inline int performance_multiplier(unsigned long nr_iowaiters, unsigned lo
 	/* mult += 2 * get_loadavg(); */
 
 	/* for IO wait tasks (per cpu!) we add 5x each */
-	mult += 10 * nr_iowaiters;
+	mult += 2 * nr_iowaiters;
 
 	return mult;
 }
@@ -327,7 +327,6 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 	if (drv->states[0].flags & CPUIDLE_FLAG_POLLING) {
 		struct cpuidle_state *s = &drv->states[1];
 		unsigned int polling_threshold;
-
 		/*
 		 * Default to a physical idle state, not to busy polling, unless
 		 * a timer is going to trigger really really soon.
@@ -373,9 +372,8 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 	idx = -1;
 	for (i = first_idx; i < drv->state_count; i++) {
 		struct cpuidle_state *s = &drv->states[i];
-		struct cpuidle_state_usage *su = &dev->states_usage[i];
 
-		if (s->disabled || su->disable)
+		if (dev->states_usage[i].disable)
 			continue;
 		if (idx == -1)
 			idx = i; /* first enabled state */
@@ -440,8 +438,7 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 			 * tick, so try to correct that.
 			 */
 			for (i = idx - 1; i >= 0; i--) {
-				if (drv->states[i].disabled ||
-				    dev->states_usage[i].disable)
+			    if (dev->states_usage[i].disable)
 					continue;
 
 				idx = i;

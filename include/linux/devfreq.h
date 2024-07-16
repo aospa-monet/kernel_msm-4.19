@@ -171,6 +171,8 @@ struct devfreq {
 	unsigned long max_freq;
 	unsigned long scaling_min_freq;
 	unsigned long scaling_max_freq;
+	bool is_boost_device;
+	bool max_boost;
 	bool stop_polling;
 
 	unsigned long suspend_freq;
@@ -235,6 +237,14 @@ extern int devfreq_resume_device(struct devfreq *devfreq);
 
 extern void devfreq_suspend(void);
 extern void devfreq_resume(void);
+
+/**
+ * update_devfreq() - Reevaluate the device and configure frequency
+ * @devfreq:	the devfreq device
+ *
+ * Note: devfreq->lock must be held
+ */
+extern int update_devfreq(struct devfreq *devfreq);
 
 /* Helper functions for devfreq user device driver with OPP. */
 extern struct dev_pm_opp *devfreq_recommended_opp(struct device *dev,

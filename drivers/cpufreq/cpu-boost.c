@@ -14,6 +14,7 @@
 #include <linux/input.h>
 #include <linux/time.h>
 #include <linux/sysfs.h>
+#include <linux/battery_saver.h>
 
 #define cpu_boost_attr_rw(_name)		\
 static struct kobj_attribute _name##_attr =	\
@@ -63,7 +64,8 @@ static bool sched_boost_active;
 
 static struct delayed_work input_boost_rem;
 static u64 last_input_time;
-#define MIN_INPUT_INTERVAL (150 * USEC_PER_MSEC)
+
+#define MIN_INPUT_INTERVAL (100 * USEC_PER_MSEC)
 
 static ssize_t store_input_boost_freq(struct kobject *kobj,
 				      struct kobj_attribute *attr,
@@ -242,7 +244,7 @@ static void cpuboost_input_event(struct input_handle *handle,
 {
 	u64 now;
 
-	if (!input_boost_enabled)
+	if (!input_boost_enabled || is_battery_saver_on())
 		return;
 
 	now = ktime_to_us(ktime_get());

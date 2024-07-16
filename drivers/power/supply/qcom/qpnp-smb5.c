@@ -24,6 +24,7 @@
 #include "smb5-reg.h"
 #include "smb5-lib.h"
 #include "schgm-flash.h"
+extern int fpsensor;
 
 static struct smb_params smb5_pmi632_params = {
 	.fcc			= {
@@ -1124,7 +1125,16 @@ static int smb5_usb_get_prop(struct power_supply *psy,
 		val->intval = get_client_vote(chg->usb_icl_votable, PD_VOTER);
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
-		rc = smblib_get_prop_input_current_max(chg, val);
+		if (smblib_get_fastcharge_mode(chg))
+#if IS_ENABLED(CONFIG_BOARD_CAS)
+			val->intval = 12000000;
+#elif IS_ENABLED(CONFIG_BOARD_CMI)
+			val->intval = 10000000;
+#else
+			val->intval = 6000000;
+#endif
+		else
+			rc = smblib_get_prop_input_current_max(chg, val);
 		break;
 	case POWER_SUPPLY_PROP_TYPE:
 		val->intval = POWER_SUPPLY_TYPE_USB_PD;
@@ -1688,6 +1698,10 @@ static int smb5_usb_main_get_prop(struct power_supply *psy,
 		break;
 	/* Use this property to report SMB health */
 	case POWER_SUPPLY_PROP_HEALTH:
+		if (chg->use_bq_pump) {
+			rc = val->intval = -ENODATA;
+			break;
+		}
 		rc = val->intval = smblib_get_prop_smb_health(chg);
 		break;
 	/* Use this property to report overheat status */
@@ -3033,9 +3047,10 @@ static int smb5_init_connector_type(struct smb_charger *chg)
 	 */
 	if (chg->chg_param.smb_version == PMI632_SUBTYPE) {
 		schgm_flash_init(chg);
-		smblib_rerun_apsd_if_required(chg);
 	}
 
+	smblib_rerun_apsd_if_required(chg);
+	
 	return 0;
 
 }
@@ -3172,7 +3187,7 @@ static int smb5_init_hw(struct smb5 *chip)
 	/* if support ffc, default vfloat set to 4.4V, only fast charge need override to 4.45V */
 	if (chg->support_ffc)
 		vote(chg->fv_votable, NON_FFC_VFLOAT_VOTER,
-				true, NON_FFC_VFLOAT_UV);
+				true, fpsensor == 1 ? 4450000 : 4400000);
 
 	/* Some h/w limit maximum supported ICL */
 	vote(chg->usb_icl_votable, HW_LIMIT_VOTER,
